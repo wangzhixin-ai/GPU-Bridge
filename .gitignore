@@ -1,0 +1,7 @@
+# Runtime files
+gpu-bridge/tasks/
+gpu-bridge/logs/
+gpu-bridge/daemon.pid
+gpu-bridge/monitor.json
+__pycache__/
+*.pyc
