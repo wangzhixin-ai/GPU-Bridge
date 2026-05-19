@@ -42,8 +42,12 @@ gpu-bridge/
 │   ├── history.jsonl      # Append-only, one JSON object per completed task
 │   └── <task_id>/
 │       └── output.log     # Duplicate of tasks/<id>/output.log
-├── monitor.json           # Machine status snapshot (refreshed every 5s by daemon)
-└── daemon.pid             # PID of running daemon
+├── nodes/                 # Multi-node daemon runtime state
+│   └── <node_id>/
+│       ├── monitor.json   # Node machine status snapshot
+│       └── daemon.pid     # Node daemon PID
+├── monitor.json           # Legacy machine status snapshot
+└── daemon.pid             # Legacy daemon PID
 ```
 
 ## Client Commands Reference
@@ -53,8 +57,9 @@ All commands use: `python gpu-bridge/client.py <subcommand> [args]`
 ### run
 Execute a shell command on the remote machine.
 ```
-run <command> [-f] [-p] [-w workdir] [-t timeout_seconds]
+run <command> [-f] [-p] [-w workdir] [-t timeout_seconds] [-N node_id]
 ```
+- `-N / --target`: Target daemon node id. Prefer label-carrying ids like `gpu-a-h200-megatron`.
 - `-f / --follow`: Stream output in real-time until task completes
 - `-p / --parallel`: Hint flag for parallel submission workflows (suppresses auto-follow)
 - `-w / --workdir`: Working directory on the remote machine (default: parent of gpu-bridge/)
@@ -63,14 +68,14 @@ run <command> [-f] [-p] [-w workdir] [-t timeout_seconds]
 ### run-script
 Copy and execute a Python script on the remote machine.
 ```
-run-script <script_path> [-f] [-p] [-w workdir] [-t timeout]
+run-script <script_path> [-f] [-p] [-w workdir] [-t timeout] [-N node_id]
 ```
 The script file is copied into the task directory so it doesn't need to exist on the remote machine beforehand.
 
 ### sync
 Copy local files/directories to a target path on the remote machine.
 ```
-sync <source1> [source2 ...] <target_directory>
+sync <source1> [source2 ...] <target_directory> [-N node_id]
 ```
 
 ### status
@@ -88,8 +93,9 @@ logs <task_id> [-f]
 ### list
 List all tasks with optional status filter.
 ```
-list [-s status]
+list [-s status] [-N node_id]
 ```
+- `-N / --target`: Filter by target daemon node id.
 Status values: `pending`, `running`, `done`, `failed`, `cancelled`
 
 ### cancel
@@ -109,10 +115,14 @@ clean [-a]
 - With `-a`: removes all tasks including pending/running
 
 ### monitor
-Display machine status from `monitor.json`.
+Display machine status from `monitor.json` or `nodes/<node_id>/monitor.json`.
 ```
-monitor [-f] [--json]
+monitor [-f] [--json] [--node node_id] [--all] [--include-stale] [--ttl seconds]
 ```
+- `--node / -N`: Show one daemon node.
+- `--all / -a`: Show all online daemon nodes by default.
+- `--include-stale`: Include stale/offline monitor files for diagnosis.
+- `--ttl`: Online heartbeat TTL in seconds; default is 60.
 - `-f / --follow`: Refresh display every 5 seconds
 - `--json`: Output raw JSON instead of formatted text
 - Shows: GPU index/name/memory/utilization/temperature, system load, memory, running tasks
@@ -120,8 +130,9 @@ monitor [-f] [--json]
 ### history
 View persistent task execution history from `logs/history.jsonl`.
 ```
-history [-n N] [-s status] [--json]
+history [-n N] [-s status] [-N node_id] [--json]
 ```
+- `-N / --target`: Filter by target daemon node id.
 - `-n / --last N`: Show only the last N entries
 - `-s / --status`: Filter by status (done, failed, cancelled)
 - `--json`: Output as JSON lines
@@ -137,8 +148,8 @@ wait --all
 
 ### daemon.py
 
-**Startup**: `python gpu-bridge/daemon.py [--max-workers=N]`
-**Shutdown**: `python gpu-bridge/daemon.py --stop` or send SIGTERM/SIGINT
+**Startup**: `python gpu-bridge/daemon.py [--max-workers=N] [--node-id=<machine-device-runtime>]`
+**Shutdown**: `python gpu-bridge/daemon.py --node-id=<node_id> --stop` or send SIGTERM/SIGINT
 
 Key behaviors:
 - **Polling**: Checks `tasks/` every 1 second for `status: "pending"` tasks
@@ -148,6 +159,19 @@ Key behaviors:
 - **Cancellation detection**: Each worker thread polls `meta.json` every second. When `status == "cancelled"` is detected: SIGTERM → wait 5s → SIGKILL
 - **Monitor thread**: A background thread runs `monitor_loop()`, collecting GPU stats (via `nvidia-smi`), system load (`os.getloadavg()`), and memory info (`/proc/meminfo`) every 5 seconds. Written atomically to `monitor.json`
 - **History**: After each task completes, a JSON record is appended to `logs/history.jsonl` under a thread lock
+
+### Multi-node Routing
+
+Multiple GPU machines can share one `tasks/` queue when each daemon has a unique node id. Put routing labels directly in the node id, including device and runtime/image labels, so agents can choose by string matching instead of a separate capability registry.
+
+- Recommended node id shape: `<machine>-<device>-<runtime>`, e.g. `gpu-a-h200-megatron`, `gpu-b-h100-vllm`, or `gpu-a-h200-megatron-torch24`.
+- Start daemon: `python gpu-bridge/daemon.py --node-id=gpu-a-h200-megatron --max-workers=4`
+- Submit to node: `python gpu-bridge/client.py run "cmd" --target gpu-a-h200-megatron -f`
+- Inspect monitors: `python gpu-bridge/client.py monitor --node gpu-a-h200-megatron` or `monitor --all`; default output only includes nodes with monitor file mtime age <= 60s.
+- Agent routing rule: infer required labels from the task, list/monitor available online node ids, then submit to a `node_id` containing all required labels. If no online node id matches, ask the user instead of guessing.
+- Task metadata uses `target_node` for the requested daemon and `worker_node` for the daemon that started it.
+- Non-default daemons only consume tasks targeted to their `node_id`. The default daemon consumes legacy untargeted tasks; non-default daemons need `--accept-untargeted` to do that.
+- Node runtime files live in `gpu-bridge/nodes/<node_id>/monitor.json` and `daemon.pid`, avoiding cross-machine overwrite.
 
 ### Task Types
 
@@ -227,26 +251,26 @@ Key behaviors:
 
 ### Running a single command and checking output
 ```bash
-python gpu-bridge/client.py run "nvidia-smi" -f
+python gpu-bridge/client.py run "nvidia-smi" --target gpu-a-h200-megatron -f
 ```
 
 ### Running a long training job
 ```bash
-python gpu-bridge/client.py run "python train.py --epochs 100" -t 86400 -f
+python gpu-bridge/client.py run "python train.py --epochs 100" --target gpu-a-h200-megatron -t 86400 -f
 ```
 
 ### Parallel job submission
 ```bash
-python gpu-bridge/client.py run "python exp1.py" -p
-python gpu-bridge/client.py run "python exp2.py" -p
-python gpu-bridge/client.py run "python exp3.py" -p
+python gpu-bridge/client.py run "python exp1.py" --target gpu-a-h200-megatron -p
+python gpu-bridge/client.py run "python exp2.py" --target gpu-a-h200-megatron -p
+python gpu-bridge/client.py run "python exp3.py" --target gpu-b-h100-vllm -p
 python gpu-bridge/client.py wait --all
 python gpu-bridge/client.py history -n 3
 ```
 
 ### Checking machine status before submitting
 ```bash
-python gpu-bridge/client.py monitor
+python gpu-bridge/client.py monitor --all
 ```
 
 ### Investigating a failed task

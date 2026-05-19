@@ -14,12 +14,42 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 TASKS_DIR = BASE_DIR / "tasks"
 LOGS_DIR = BASE_DIR / "logs"
+NODES_DIR = BASE_DIR / "nodes"
 MONITOR_FILE = BASE_DIR / "monitor.json"
+DEFAULT_MONITOR_TTL = 60
 
 
 def gen_task_id():
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     return time.strftime("%Y%m%d_%H%M%S") + "_" + suffix
+
+
+def validate_node_id(node_id):
+    if node_id and (any(c in node_id for c in "/\\") or node_id in (".", "..")):
+        print("Error: node id must not contain path separators", file=sys.stderr)
+        sys.exit(1)
+    return node_id
+
+
+def add_target(meta, target):
+    target = validate_node_id(target or os.environ.get("GPU_BRIDGE_TARGET_NODE"))
+    if target:
+        meta["target_node"] = target
+
+
+def monitor_age_seconds(path):
+    try:
+        return max(0, time.time() - path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def annotate_monitor(data, ttl, path):
+    # Use shared-file mtime for heartbeat age. Node-local timestamps may use different timezones.
+    age = monitor_age_seconds(path)
+    data["age_seconds"] = None if age is None else round(age, 1)
+    data["online"] = age is not None and age <= ttl
+    return data
 
 
 def create_task(meta, script_content=None, files_to_sync=None):
@@ -87,6 +117,7 @@ def cmd_run(args):
         "timeout": args.timeout,
         "env": {},
     }
+    add_target(meta, args.target)
     create_task(meta)
     print(f"Task submitted: {task_id}")
     if args.follow:
@@ -109,6 +140,7 @@ def cmd_run_script(args):
         "timeout": args.timeout,
         "env": {},
     }
+    add_target(meta, args.target)
     create_task(meta, script_content=script_path.read_text())
     print(f"Task submitted: {task_id}")
     if args.follow:
@@ -129,6 +161,7 @@ def cmd_sync(args):
         "timeout": 60,
         "env": {},
     }
+    add_target(meta, args.target_node)
     create_task(meta, files_to_sync=sources)
     print(f"Task submitted: {task_id}")
 
@@ -141,6 +174,8 @@ def cmd_status(args):
     print(f"ID:      {meta['id']}")
     print(f"Type:    {meta['type']}")
     print(f"Status:  {meta['status']}")
+    print(f"Target:  {meta.get('target_node', '-')}")
+    print(f"Worker:  {meta.get('worker_node', '-')}")
     print(f"Created: {meta['created_at']}")
     print(f"Command: {meta.get('command', 'N/A')}")
     result_path = TASKS_DIR / args.task_id / "result.json"
@@ -226,20 +261,22 @@ def cmd_list(args):
             continue
         if args.status and meta["status"] != args.status:
             continue
+        if args.target and meta.get("target_node") != args.target:
+            continue
         tasks.append(meta)
 
     if not tasks:
         print("No tasks found.")
         return
 
-    fmt = "{:<28} {:<10} {:<10} {}"
-    print(fmt.format("ID", "TYPE", "STATUS", "COMMAND"))
-    print("-" * 80)
+    fmt = "{:<28} {:<10} {:<10} {:<14} {}"
+    print(fmt.format("ID", "TYPE", "STATUS", "TARGET", "COMMAND"))
+    print("-" * 96)
     for m in tasks:
         cmd = m.get("command", "")
         if len(cmd) > 30:
             cmd = cmd[:27] + "..."
-        print(fmt.format(m["id"], m["type"], m["status"], cmd))
+        print(fmt.format(m["id"], m["type"], m["status"], m.get("target_node", "-"), cmd))
 
 
 def cmd_cancel(args):
@@ -286,22 +323,54 @@ def cmd_clean(args):
 
 
 def cmd_monitor(args):
-    def print_monitor():
-        if not MONITOR_FILE.exists():
-            print("No monitor data available. Is the daemon running?", file=sys.stderr)
-            return False
+    def monitor_paths():
+        if args.all:
+            node_paths = []
+            if NODES_DIR.exists():
+                node_paths = sorted(NODES_DIR.glob("*/monitor.json"))
+            if node_paths:
+                return node_paths
+            if MONITOR_FILE.exists():
+                return [MONITOR_FILE]
+            return []
+        if args.node:
+            return [NODES_DIR / validate_node_id(args.node) / "monitor.json"]
+        if MONITOR_FILE.exists():
+            return [MONITOR_FILE]
+        default_monitor = NODES_DIR / "default" / "monitor.json"
+        if default_monitor.exists():
+            return [default_monitor]
+        if NODES_DIR.exists():
+            return sorted(NODES_DIR.glob("*/monitor.json"))
+        return [MONITOR_FILE]
+
+    def read_monitor(path):
+        if not path.exists():
+            return None
         try:
-            with open(MONITOR_FILE) as f:
+            with open(path) as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
-            print("Failed to read monitor data.", file=sys.stderr)
+            return None
+        return annotate_monitor(data, args.ttl, path)
+
+    def print_one_monitor(path):
+        data = read_monitor(path)
+        if data is None:
+            if args.node:
+                print("No monitor data available. Is the daemon running?", file=sys.stderr)
+            return False
+        if not data["online"] and not args.include_stale:
             return False
 
         if args.json:
             print(json.dumps(data, indent=2))
             return True
 
-        print(f"=== GPU Status ({data.get('timestamp', 'N/A')}) ===\n")
+        node_id = data.get("node_id")
+        title = f"GPU Status: {node_id}" if node_id else "GPU Status"
+        state = "ONLINE" if data["online"] else f"STALE age={data['age_seconds']}s"
+        print(f"=== {title} [{state}] ({data.get('timestamp', 'N/A')}) ===\n")
 
         # GPUs
         gpus = data.get("gpus", [])
@@ -334,6 +403,15 @@ def cmd_monitor(args):
         print()
         return True
 
+    def print_monitor():
+        paths = monitor_paths()
+        printed = False
+        for path in paths:
+            printed = print_one_monitor(path) or printed
+        if not printed and args.node:
+            print("No online monitor data available. Is the daemon running?", file=sys.stderr)
+        return printed
+
     if args.follow:
         try:
             while True:
@@ -365,6 +443,8 @@ def cmd_history(args):
 
     if args.status:
         records = [r for r in records if r.get("status") == args.status]
+    if args.target:
+        records = [r for r in records if r.get("target_node") == args.target]
 
     if args.last:
         records = records[-args.last:]
@@ -378,9 +458,9 @@ def cmd_history(args):
             print(json.dumps(r))
         return
 
-    fmt = "{:<28} {:<10} {:<10} {:<6} {}"
-    print(fmt.format("ID", "TYPE", "STATUS", "EXIT", "COMMAND"))
-    print("-" * 85)
+    fmt = "{:<28} {:<10} {:<10} {:<6} {:<14} {}"
+    print(fmt.format("ID", "TYPE", "STATUS", "EXIT", "TARGET", "COMMAND"))
+    print("-" * 100)
     for r in records:
         cmd = r.get("command", "")
         if len(cmd) > 30:
@@ -390,6 +470,7 @@ def cmd_history(args):
             r.get("type", ""),
             r.get("status", ""),
             str(r.get("exit_code", "")),
+            r.get("target_node", "-"),
             cmd,
         ))
 
@@ -439,6 +520,7 @@ def main():
     p_run.add_argument("command", help="Shell command to execute")
     p_run.add_argument("--workdir", "-w", default=None)
     p_run.add_argument("--timeout", "-t", type=int, default=300)
+    p_run.add_argument("--target", "-N", default=None, help="Target daemon node id")
     p_run.add_argument("--follow", "-f", action="store_true", help="Follow output")
     p_run.add_argument("--parallel", "-p", action="store_true", help="Hint: parallel submission (no auto-follow)")
     p_run.set_defaults(func=cmd_run)
@@ -447,6 +529,7 @@ def main():
     p_script.add_argument("script", help="Path to Python script")
     p_script.add_argument("--workdir", "-w", default=None)
     p_script.add_argument("--timeout", "-t", type=int, default=300)
+    p_script.add_argument("--target", "-N", default=None, help="Target daemon node id")
     p_script.add_argument("--follow", "-f", action="store_true", help="Follow output")
     p_script.add_argument("--parallel", "-p", action="store_true", help="Hint: parallel submission (no auto-follow)")
     p_script.set_defaults(func=cmd_run_script)
@@ -454,6 +537,7 @@ def main():
     p_sync = sub.add_parser("sync", help="Sync files to target path")
     p_sync.add_argument("sources", nargs="+", help="Source files/dirs")
     p_sync.add_argument("target", help="Target directory on remote machine")
+    p_sync.add_argument("--target-node", "-N", default=None, help="Target daemon node id")
     p_sync.set_defaults(func=cmd_sync)
 
     p_status = sub.add_parser("status", help="Check task status")
@@ -467,6 +551,7 @@ def main():
 
     p_list = sub.add_parser("list", help="List tasks")
     p_list.add_argument("--status", "-s", default=None)
+    p_list.add_argument("--target", "-N", default=None, help="Filter by target daemon node id")
     p_list.set_defaults(func=cmd_list)
 
     p_cancel = sub.add_parser("cancel", help="Cancel a task")
@@ -479,6 +564,10 @@ def main():
     p_clean.set_defaults(func=cmd_clean)
 
     p_monitor = sub.add_parser("monitor", help="Show machine status")
+    p_monitor.add_argument("--node", "-N", default=None, help="Show one daemon node")
+    p_monitor.add_argument("--all", "-a", action="store_true", help="Show all daemon nodes")
+    p_monitor.add_argument("--include-stale", action="store_true", help="Include stale/offline node monitors")
+    p_monitor.add_argument("--ttl", type=int, default=DEFAULT_MONITOR_TTL, help="Online TTL in seconds")
     p_monitor.add_argument("--follow", "-f", action="store_true", help="Refresh every 5 seconds")
     p_monitor.add_argument("--json", action="store_true", help="Output raw JSON")
     p_monitor.set_defaults(func=cmd_monitor)
@@ -486,6 +575,7 @@ def main():
     p_history = sub.add_parser("history", help="View task execution history")
     p_history.add_argument("--last", "-n", type=int, default=None, help="Show last N entries")
     p_history.add_argument("--status", "-s", default=None, help="Filter by status")
+    p_history.add_argument("--target", "-N", default=None, help="Filter by target daemon node id")
     p_history.add_argument("--json", action="store_true", help="Output as JSON lines")
     p_history.set_defaults(func=cmd_history)
 

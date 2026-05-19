@@ -8,9 +8,9 @@ GPU-Bridge 可以作为 AI 编程助手的 skill/agent 使用，让 AI 自动在
 2. Server（`gpu-bridge/daemon.py`）已在 GPU 服务器上启动
 
 ```bash
-# 在 GPU 服务器上
+# 在 GPU 服务器上；node id 中直接带设备/镜像环境 label
 cd /path/to/GPU-Bridge
-python gpu-bridge/daemon.py
+python gpu-bridge/daemon.py --node-id=gpu-a-h200-megatron
 ```
 
 ## Claude Code 配置
@@ -48,7 +48,7 @@ cp skills/gpu-bridge/SKILL.md ~/.claude/skills/gpu-bridge/SKILL.md
 ---
 name: gpu-bridge
 description: Execute commands and scripts on remote GPU server via shared filesystem.
-argument-hint: <shell command or "status task_id" or "list">
+argument-hint: <shell command plus --target node_id, or "status task_id", or "monitor --all">
 user-invocable: true
 allowed-tools: Bash, Read, Write, Grep, Glob
 ---
@@ -60,7 +60,7 @@ allowed-tools: Bash, Read, Write, Grep, Glob
 python /your/shared/path/GPU-Bridge/gpu-bridge/client.py
 ```
 
-配置完成后，即可通过 `/gpu-bridge nvidia-smi` 等方式调用。
+配置完成后，即可通过 `/gpu-bridge nvidia-smi --target gpu-a-h200-megatron` 等方式调用。
 
 ## OpenAI Codex 配置
 
@@ -76,20 +76,20 @@ Codex 通过项目根目录的 `AGENTS.md`（或 `codex.md`）读取指令。
 To run commands on the remote GPU server, use the client script:
 
 \```bash
-python /your/shared/path/GPU-Bridge/gpu-bridge/client.py run "<command>" -f
+python /your/shared/path/GPU-Bridge/gpu-bridge/client.py run "<command>" --target gpu-a-h200-megatron -f
 \```
 
 Available subcommands:
-- `run "<cmd>" -f` — Execute shell command, follow output
-- `run-script <file.py> -f` — Execute Python script
-- `list` — List all tasks
+- `run "<cmd>" --target <node_id> -f` — Execute shell command, follow output
+- `run-script <file.py> --target <node_id> -f` — Execute Python script
+- `list --target <node_id>` — List tasks for a target node
 - `status <task_id>` — Show task details
 - `logs <task_id>` — View task output
 - `cancel <task_id>` — Cancel a task
-- `monitor` — Show GPU/system status
+- `monitor --all` — Show online GPU/system node statuses; stale nodes are hidden by default
 - `wait --all` — Wait for all tasks to finish
 
-When the user asks to run something on the GPU server, use these commands.
+Node ids should include routing labels directly, e.g. `gpu-a-h200-megatron` or `gpu-b-h100-vllm`. When the user asks to run something on the GPU server, use `monitor --all` to inspect online nodes, infer required labels from the task, and submit to a node id containing those labels; ask if no online node id matches.
 \```
 ```
 
@@ -103,10 +103,10 @@ When the user asks to run something on the GPU server, use these commands.
 
 ```
 # Claude Code
-/gpu-bridge nvidia-smi
+/gpu-bridge nvidia-smi --target gpu-a-h200-megatron
 
 # 或直接用自然语言
-> 在 GPU 服务器上跑一下 nvidia-smi
+> 在 H200 megatron 环境上跑一下 nvidia-smi
 ```
 
 如果任务一直停在 `pending`，说明 server 端的 `daemon.py` 没有启动。

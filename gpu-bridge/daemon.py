@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """GPU-side daemon that polls for and executes tasks from the shared filesystem."""
 
+import argparse
 import json
 import os
 import signal
@@ -13,8 +14,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 TASKS_DIR = BASE_DIR / "tasks"
 LOGS_DIR = BASE_DIR / "logs"
-MONITOR_FILE = BASE_DIR / "monitor.json"
-PID_FILE = BASE_DIR / "daemon.pid"
+NODES_DIR = BASE_DIR / "nodes"
+LEGACY_PID_FILE = BASE_DIR / "daemon.pid"
 POLL_INTERVAL = 1
 MAX_WORKERS = 4
 
@@ -22,6 +23,24 @@ running = True
 active_processes = {}  # task_id -> subprocess.Popen
 lock = threading.Lock()
 history_lock = threading.Lock()
+
+
+def validate_node_id(node_id):
+    if not node_id or any(c in node_id for c in "/\\") or node_id in (".", ".."):
+        raise ValueError("node id must be a non-empty name without path separators")
+    return node_id
+
+
+def node_dir(node_id):
+    return NODES_DIR / validate_node_id(node_id)
+
+
+def node_monitor_file(node_id):
+    return node_dir(node_id) / "monitor.json"
+
+
+def node_pid_file(node_id):
+    return node_dir(node_id) / "daemon.pid"
 
 
 def sig_handler(signum, frame):
@@ -84,6 +103,8 @@ def append_history(meta, exit_code):
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "exit_code": exit_code,
         "working_dir": meta.get("working_dir", ""),
+        "target_node": meta.get("target_node", ""),
+        "worker_node": meta.get("worker_node", ""),
     }
     history_path = LOGS_DIR / "history.jsonl"
     with history_lock:
@@ -91,9 +112,10 @@ def append_history(meta, exit_code):
             f.write(json.dumps(record) + "\n")
 
 
-def execute_task(task_dir, meta):
+def execute_task(task_dir, meta, node_id):
     task_id = meta["id"]
     meta["status"] = "running"
+    meta["worker_node"] = node_id
     meta["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     write_meta(task_dir, meta)
 
@@ -222,12 +244,13 @@ def execute_task(task_dir, meta):
         append_history(meta, exit_code)
 
 
-def monitor_loop():
+def monitor_loop(node_id, monitor_file):
     """Periodically collect system/GPU stats and write monitor.json."""
     while running:
         try:
             snapshot = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "node_id": node_id,
                 "gpus": [],
                 "system": {},
                 "running_tasks": [],
@@ -283,10 +306,10 @@ def monitor_loop():
                 snapshot["running_tasks"] = list(active_processes.keys())
 
             # Atomic write
-            tmp = MONITOR_FILE.parent / "monitor.json.tmp"
+            tmp = monitor_file.parent / "monitor.json.tmp"
             with open(tmp, "w") as f:
                 json.dump(snapshot, f, indent=2)
-            tmp.rename(MONITOR_FILE)
+            tmp.rename(monitor_file)
 
         except Exception:
             pass
@@ -297,7 +320,14 @@ def monitor_loop():
             time.sleep(0.1)
 
 
-def get_pending_tasks():
+def accepts_task(meta, node_id, accept_untargeted):
+    target_node = meta.get("target_node")
+    if target_node:
+        return target_node == node_id
+    return accept_untargeted
+
+
+def get_pending_tasks(node_id, accept_untargeted):
     if not TASKS_DIR.exists():
         return []
     tasks = []
@@ -305,28 +335,46 @@ def get_pending_tasks():
         if not d.is_dir():
             continue
         meta = read_meta(d)
-        if meta and meta.get("status") == "pending":
+        if meta and meta.get("status") == "pending" and accepts_task(meta, node_id, accept_untargeted):
             tasks.append((d, meta))
     tasks.sort(key=lambda x: x[1].get("created_at", ""))
     return tasks
 
 
-def stop_daemon():
-    if not PID_FILE.exists():
-        print("No daemon PID file found.")
+def parse_args():
+    parser = argparse.ArgumentParser(description="GPU-Bridge daemon")
+    parser.add_argument("--max-workers", type=int, default=MAX_WORKERS)
+    parser.add_argument("--node-id", default=os.environ.get("GPU_BRIDGE_NODE_ID", "default"))
+    parser.add_argument("--accept-untargeted", action="store_true", help="Also run tasks without target_node")
+    parser.add_argument("--stop", action="store_true", help="Stop the daemon for this node id")
+    return parser.parse_args()
+
+
+def stop_daemon(node_id):
+    pid_file = node_pid_file(node_id)
+    if not pid_file.exists() and node_id == "default" and LEGACY_PID_FILE.exists():
+        pid_file = LEGACY_PID_FILE
+    if not pid_file.exists():
+        print(f"No daemon PID file found for node {node_id}.")
         return
-    pid = int(PID_FILE.read_text().strip())
+    pid = int(pid_file.read_text().strip())
     try:
         os.kill(pid, signal.SIGTERM)
-        print(f"Sent SIGTERM to daemon (PID {pid}).")
+        print(f"Sent SIGTERM to daemon {node_id} (PID {pid}).")
     except ProcessLookupError:
-        print(f"Daemon (PID {pid}) not running.")
-    PID_FILE.unlink(missing_ok=True)
+        print(f"Daemon {node_id} (PID {pid}) not running.")
+    pid_file.unlink(missing_ok=True)
 
 
 def main():
-    if "--stop" in sys.argv:
-        stop_daemon()
+    args = parse_args()
+    node_id = validate_node_id(args.node_id)
+    accept_untargeted = args.accept_untargeted or node_id == "default"
+    pid_file = node_pid_file(node_id)
+    monitor_file = node_monitor_file(node_id)
+
+    if args.stop:
+        stop_daemon(node_id)
         return
 
     signal.signal(signal.SIGTERM, sig_handler)
@@ -334,17 +382,16 @@ def main():
 
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(str(os.getpid()))
 
-    max_workers = MAX_WORKERS
-    for arg in sys.argv[1:]:
-        if arg.startswith("--max-workers="):
-            max_workers = int(arg.split("=", 1)[1])
-
-    print(f"Daemon started (PID {os.getpid()}, max_workers={max_workers})")
+    print(
+        f"Daemon started (node_id={node_id}, PID {os.getpid()}, "
+        f"max_workers={args.max_workers}, accept_untargeted={accept_untargeted})"
+    )
 
     # Start monitor thread
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread = threading.Thread(target=monitor_loop, args=(node_id, monitor_file), daemon=True)
     monitor_thread.start()
 
     workers = []
@@ -354,12 +401,12 @@ def main():
             # Clean finished threads
             workers = [t for t in workers if t.is_alive()]
 
-            if len(workers) < max_workers:
-                pending = get_pending_tasks()
+            if len(workers) < args.max_workers:
+                pending = get_pending_tasks(node_id, accept_untargeted)
                 for task_dir, meta in pending:
-                    if len(workers) >= max_workers:
+                    if len(workers) >= args.max_workers:
                         break
-                    t = threading.Thread(target=execute_task, args=(task_dir, meta), daemon=True)
+                    t = threading.Thread(target=execute_task, args=(task_dir, meta, node_id), daemon=True)
                     t.start()
                     workers.append(t)
 
@@ -372,8 +419,8 @@ def main():
                     proc.kill()
                 except OSError:
                     pass
-        PID_FILE.unlink(missing_ok=True)
-        MONITOR_FILE.unlink(missing_ok=True)
+        pid_file.unlink(missing_ok=True)
+        monitor_file.unlink(missing_ok=True)
         print("Daemon stopped.")
 
 

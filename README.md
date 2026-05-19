@@ -22,8 +22,13 @@ python gpu-bridge/daemon.py
 # 自定义并行数
 python gpu-bridge/daemon.py --max-workers=8
 
+# 多机器场景：给每台 GPU 机器指定唯一 node id
+python gpu-bridge/daemon.py --node-id=gpu-a-h200-megatron --max-workers=4
+python gpu-bridge/daemon.py --node-id=gpu-b-h100-vllm --max-workers=4
+
 # 停止守护进程
 python gpu-bridge/daemon.py --stop
+python gpu-bridge/daemon.py --node-id=gpu-a-h200-megatron --stop
 ```
 
 ### 2. 提交任务（在客户端）
@@ -38,8 +43,13 @@ python gpu-bridge/client.py run "python train.py --epochs 10" -f
 # 指定工作目录和超时时间（秒）
 python gpu-bridge/client.py run "bash train.sh" -w /path/to/project -t 3600
 
+# 指定目标 GPU 机器
+python gpu-bridge/client.py run "bash train_a.sh" --target gpu-a-h200-megatron -f
+python gpu-bridge/client.py run "bash train_b.sh" --target gpu-b-h100-vllm -f
+
 # 执行 Python 脚本（会将脚本文件复制到远程机器）
 python gpu-bridge/client.py run-script my_script.py -f
+python gpu-bridge/client.py run-script my_script.py --target gpu-a-h200-megatron -f
 
 # 同步文件到远程机器指定路径
 python gpu-bridge/client.py sync local_file.py local_dir/ /target/path
@@ -113,13 +123,54 @@ python gpu-bridge/client.py wait --all
 python gpu-bridge/client.py wait <id1> <id2> <id3>
 ```
 
+## 多机器执行
+
+如果两台 GPU 机器共享同一个 `GPU-Bridge` 目录，不要直接启动两个未区分身份的 daemon。应给每台机器指定唯一 `node_id`，并直接把设备、镜像/运行环境等 label 写进 `node_id`，然后提交任务时用 `--target` 指定目标机器。agent 选择机器时只需要匹配 `node_id` 中的 label，不需要额外维护一套机器能力表。
+
+推荐命名格式：`<machine>-<device>-<runtime>`，例如 `gpu-a-h200-megatron`、`gpu-b-h100-vllm`。需要多个 label 时继续追加即可，例如 `gpu-a-h200-megatron-torch24`。
+
+```bash
+# 在机器 A 上：H200 + megatron 镜像/环境
+python gpu-bridge/daemon.py --node-id=gpu-a-h200-megatron --max-workers=4
+
+# 在机器 B 上：H100 + vllm 镜像/环境
+python gpu-bridge/daemon.py --node-id=gpu-b-h100-vllm --max-workers=4
+
+# 在客户端提交到指定机器
+python gpu-bridge/client.py run "bash exp_a.sh" --target gpu-a-h200-megatron -p
+python gpu-bridge/client.py run "bash exp_b.sh" --target gpu-b-h100-vllm -p
+
+# 也可以用环境变量设置默认目标
+GPU_BRIDGE_TARGET_NODE=gpu-a-h200-megatron python gpu-bridge/client.py run "nvidia-smi" -f
+```
+
+daemon 的消费规则：
+
+- `--node-id=gpu-a-h200-megatron` 只消费 `target_node == "gpu-a-h200-megatron"` 的任务。
+- 未指定 `--node-id` 的默认 daemon 使用 `node_id=default`，会兼容消费没有 `target_node` 的旧任务。
+- 非 default daemon 默认不会消费未指定目标的任务；如确实需要，可加 `--accept-untargeted`。
+
+查看指定目标的任务：
+
+```bash
+python gpu-bridge/client.py list --target gpu-a-h200-megatron
+python gpu-bridge/client.py history --target gpu-b-h100-vllm
+```
+
 ## 机器监控
 
-守护进程每 5 秒采集一次机器状态（GPU、CPU、内存），写入 `monitor.json`。
+守护进程每 5 秒采集一次机器状态（GPU、CPU、内存），单机兼容模式可读取 `monitor.json`；多机器模式写入 `nodes/<node_id>/monitor.json`。`monitor --all` 默认只显示 60 秒内更新过的在线节点，机器异常关机后会自动从默认列表里消失。
 
 ```bash
 # 查看当前状态
 python gpu-bridge/client.py monitor
+
+# 查看指定机器或全部在线机器（默认只显示 monitor 文件 60 秒内有 heartbeat 的节点）
+python gpu-bridge/client.py monitor --node gpu-a-h200-megatron
+python gpu-bridge/client.py monitor --all
+
+# 排查异常关机/离线节点时，显示过期 monitor
+python gpu-bridge/client.py monitor --all --include-stale
 
 # 持续刷新（每 5 秒）
 python gpu-bridge/client.py monitor -f
@@ -175,8 +226,12 @@ gpu-bridge/
 │   ├── history.jsonl      # 所有任务的执行记录
 │   └── <task_id>/
 │       └── output.log     # 输出日志副本
-├── monitor.json       # 机器状态快照（daemon 每 5 秒刷新）
-└── daemon.pid         # 守护进程 PID 文件
+├── nodes/             # 多机器 daemon 运行时状态
+│   └── <node_id>/
+│       ├── monitor.json   # 该机器状态快照
+│       └── daemon.pid     # 该机器守护进程 PID
+├── monitor.json       # 旧版/兼容机器状态快照
+└── daemon.pid         # 旧版/兼容守护进程 PID 文件
 ```
 
 ## 任务状态流转
